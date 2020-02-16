@@ -74,7 +74,7 @@ class Gslug(object):
         headers = {
             "Referer": self.referer,
         }
-        r = self.s.get(url, headers=headers, timeout=5)
+        r = self.s.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         _key_re = re.search(r"key:\s*\W([0-9a-f]+)\W", r.text, re.I)
         if _key_re:
@@ -93,7 +93,7 @@ class Gslug(object):
         data = {
             "slug": self.slug,
         }
-        r = self.s.post(guest_url, headers=headers, data=data, timeout=5)
+        r = self.s.post(guest_url, headers=headers, data=data, timeout=15)
         r.raise_for_status()
         return r.json()
 
@@ -110,7 +110,7 @@ class Gslug(object):
             "type": "slug",
             "value": self.slug,
         }
-        r = self.s.post(vip_url, headers=headers, data=data, timeout=5)
+        r = self.s.post(vip_url, headers=headers, data=data, timeout=15)
         r.raise_for_status()
         return r.json()
 
@@ -122,7 +122,7 @@ class Gslug(object):
             ._replace(path="", params="", query="", fragment="")
             .geturl(),
         }
-        r = self.s.get(ping_url, headers=headers, timeout=5)
+        r = self.s.get(ping_url, headers=headers, timeout=15)
         r.raise_for_status()
 
     def get_key(self, key_url):
@@ -132,7 +132,7 @@ class Gslug(object):
             ._replace(path="", params="", query="", fragment="")
             .geturl(),
         }
-        r = self.s.get(key_url, headers=headers, timeout=5)
+        r = self.s.get(key_url, headers=headers, timeout=15)
         r.raise_for_status()
         self.m3u8_key = r.content
 
@@ -146,7 +146,7 @@ class Gslug(object):
                 ._replace(path="", params="", query="", fragment="")
                 .geturl(),
             }
-            r = self.s.get(url, headers=headers, timeout=5)
+            r = self.s.get(url, headers=headers, timeout=15)
             r.raise_for_status()
             g_url = b64decode(r.json()["url"]).decode("utf-8")
             self.segments[url] = g_url
@@ -167,7 +167,7 @@ class Gslug(object):
             "#EXT-X-TARGETDURATION:{0}\n".format(self.playlist[stream]["duration"]),
             "#EXT-X-MEDIA-SEQUENCE:1\n",
         ]
-        if "hash" in self.playlist:
+        if "hash" in self.playlist[stream]:
             key_url = "https://{0}/hash/{1}?key={2}".format(
                 self.playlist["servers"]["stream"],
                 self.playlist[stream]["sig"],
