@@ -10,7 +10,7 @@ import re
 import requests
 from requests.packages.urllib3.util import Retry
 from requests.adapters import HTTPAdapter
-from requests.exceptions import HTTPError
+from requests.exceptions import HTTPError, ConnectionError
 from hashlib import sha256
 from base64 import b64decode
 from future.moves.urllib.parse import urlparse, parse_qsl, urljoin
@@ -79,7 +79,7 @@ class SlugPlaylist(threading.Thread, object):
         try:
             r = self.s.post(_api_url, headers={"Referer": s_url, "Origin": s_origin,}, data=_data, timeout=5, verify=False,)
             r.raise_for_status()
-        except HTTPError:
+        except (HTTPError, ConnectionError) as e:
             """ stream offline/blocked """
             print(repr(r.text))
             self.abort.set()
@@ -115,8 +115,14 @@ class SlugPlaylist(threading.Thread, object):
                     self.host[0], self.host[1], self.path, s_stream["iv"]
                 )
             )
-            r = self.s.get(s_key_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
-            r.raise_for_status()
+            try:
+                r = self.s.get(s_key_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
+                r.raise_for_status()
+            except (HTTPError, ConnectionError) as e:
+                """ stream offline/blocked """
+                print(repr(r.text))
+                self.abort.set()
+                return None, None, None
             s_key = r.content
         s_segment_urls = []
         for i, _id in enumerate(s_stream["ids"]):
@@ -152,10 +158,13 @@ class SlugPlaylist(threading.Thread, object):
                 if seg_url in self.segment_urls:
                     location = self.segment_urls[seg_url]
                 else:
-                    r = self.s.get(seg_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
-                    r.raise_for_status()
-                    location = b64decode(r.json()["url"]).decode("utf-8")
-                    self.segment_urls[seg_url] = location
+                    try:
+                        r = self.s.get(seg_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
+                        r.raise_for_status()
+                        location = b64decode(r.json()["url"]).decode("utf-8")
+                        self.segment_urls[seg_url] = location
+                    except (HTTPError, ConnectionError) as e:
+                        location = ''
                 self.handler_q[hid][1].put(location)
             except Empty:
                 pass
@@ -212,11 +221,15 @@ class GslugHandler(BaseHTTPRequestHandler, object):
                 self.server.notify_q.put(handler_id)
                 self.server.handler_q[handler_id][0].put(segment_id)
                 location = self.server.handler_q[handler_id][1].get(timeout=30)
-                self.send_response(301)
-                self.send_header("Location", location)
-                self.send_header("Content-length", 0)
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
+                if location:
+                    self.send_response(301)
+                    self.send_header("Location", location)
+                    self.send_header("Content-length", 0)
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                else:
+                    self.send_error(404)
+                    self.end_headers()
             else:
                 self.send_error(404)
                 self.end_headers()
