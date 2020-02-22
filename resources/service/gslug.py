@@ -10,6 +10,7 @@ import re
 import requests
 from requests.packages.urllib3.util import Retry
 from requests.adapters import HTTPAdapter
+from requests.exceptions import HTTPError
 from hashlib import sha256
 from base64 import b64decode
 from future.moves.urllib.parse import urlparse, parse_qsl, urljoin
@@ -75,8 +76,14 @@ class SlugPlaylist(threading.Thread, object):
         if _key:
             _api_url = "http://multi.idocdn.com/vip"
             _data = {"key": _key, "type": "slug", "value": _slug}
-        r = self.s.post(_api_url, headers={"Referer": s_url, "Origin": s_origin,}, data=_data, timeout=5, verify=False,)
-        r.raise_for_status()
+        try:
+            r = self.s.post(_api_url, headers={"Referer": s_url, "Origin": s_origin,}, data=_data, timeout=5, verify=False,)
+            r.raise_for_status()
+        except HTTPError:
+            """ stream offline/blocked """
+            print(repr(r.text))
+            self.abort.set()
+            return None, None, None
         s_json = r.json()
         """ compile playlist """
         s_stream = None
@@ -93,7 +100,7 @@ class SlugPlaylist(threading.Thread, object):
             s_stream = s_json[quality]
         if not s_stream:
             """ stream offline/blocked """
-            print(repr(s_json))
+            print(repr(r.text))
             self.abort.set()
             return None, None, None
         s_playlist.append("#EXTM3U\n")

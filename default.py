@@ -68,6 +68,7 @@ def root():
             li.setContentLookup(False)
             xbmcplugin.setResolvedUrl(plugin.handle, True, li)
         else:
+            xbmcgui.Dialog().notification(plugin.name, "Stream offline", xbmcgui.NOTIFICATION_ERROR)
             xbmcplugin.setResolvedUrl(plugin.handle, False, xbmcgui.ListItem())
 
 
