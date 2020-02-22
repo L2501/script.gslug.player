@@ -43,20 +43,23 @@ def root():
             )
         )
 
-        playlist_path = "http://localhost:{0}/{1}.m3u8".format(
+        playlist_path = "http://127.0.0.1:{0}/{1}/chunks.m3u8".format(
             _port, sha256(gslug_url.encode("utf-8")).hexdigest()
         )
 
-        timeout = 10
-        for i in range(timeout):
+        timeout = 0
+        monitor = xbmc.Monitor()
+        while not monitor.abortRequested() and (timeout < 10):
             try:
                 _r = requests.get(playlist_path, stream=True, timeout=1)
-                _r.close()
                 _r.raise_for_status()
                 LIVE = True
                 break
             except Exception:
-                xbmc.sleep(1000)
+                if monitor.waitForAbort(1):
+                    break
+                else:
+                    timeout +=1
 
         if LIVE:
             headers = urlencode([("User-Agent", user_agent,)])

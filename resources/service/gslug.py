@@ -1,281 +1,295 @@
 # -*- coding: utf-8 -*-
-from __future__ import unicode_literals
+from __future__ import unicode_literals, absolute_import
 
 import sys
-import errno
 import socket
+import errno
+import threading
+import posixpath
 import re
 import requests
-from future.moves.urllib.parse import urljoin, urlparse, parse_qsl, urlencode
-from base64 import b64decode
+from requests.packages.urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 from hashlib import sha256
+from base64 import b64decode
+from future.moves.urllib.parse import urlparse, parse_qsl, urljoin
+from future.moves.http.server import BaseHTTPRequestHandler
+from future.moves.socketserver import ThreadingMixIn, TCPServer
+from queue import Queue, Empty
 from xbmc import Monitor, Player
-from functools import partial
+import warnings
 
-try:
-    from http.server import BaseHTTPRequestHandler
-    from http.server import HTTPServer
-except ImportError:
-    # Python 2.7
-    from BaseHTTPServer import BaseHTTPRequestHandler
-    from BaseHTTPServer import HTTPServer
-
-try:
-    from socketserver import ThreadingMixIn
-except ImportError:
-    # Python 2.7
-    from SocketServer import ThreadingMixIn
-
-ACCEPTABLE_ERRNO = (
-    errno.ECONNABORTED,
-    errno.ECONNRESET,
-    errno.EINVAL,
-    errno.EPIPE,
-)
-try:
-    ACCEPTABLE_ERRNO += (errno.WSAECONNABORTED,)
-except AttributeError:
-    pass  # Not windows
+warnings.simplefilter("ignore")
+retries = Retry(total=5, method_whitelist=["GET", "POST"], backoff_factor=1,)
+retryable_adapter = HTTPAdapter(max_retries=retries)
 
 
-class Gslug(object):
-    def __init__(self, url, referer, user_agent, host):
-        self.user_agent = user_agent
-        self.quality_pref = ("fullhd", "hd", "mhd", "sd", "origin")
+class SlugPlaylist(threading.Thread, object):
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None):
+        super(SlugPlaylist, self).__init__(group=group, target=target, name=name)
+        self.abort = kwargs.get("abort")
+        """ (url, referer, user_agent, quality) """
+        self.stream_info = kwargs.get("stream_info")
+        """ (host, port) """
+        self.host = kwargs.get("host")
+        """ request session """
         self.s = requests.Session()
-        self.s.headers.update({"User-Agent": self.user_agent})
-        self.url = url
-        self.referer = referer
-        self.host = host
-        self.slug = self.parse_slug_from_url(self.url)
-        self.key = self.scrape_key_from_url(self.url)
-        if self.key:
-            self.playlist = self.get_playlist_vip()
-        else:
-            self.playlist = self.get_playlist_guest()
-        self.segments = {}
-        self.m3u8_path = "/{0}.m3u8".format(sha256(url.encode("utf-8")).hexdigest())
-        self.m3u8_key = ""
-        self.m3u8 = ""
+        self.s.headers.update({"User-Agent": self.stream_info[2]})
+        self.s.mount("https://", retryable_adapter)
+        self.s.mount("http://", retryable_adapter)
+        """ playlist info """
+        self.path = sha256(self.stream_info[0].encode("utf-8")).hexdigest()
+        self.playlist, self.key, self.segments = self.fetch_playlist()
+        self.segment_urls = {}
+        """ queues """
+        self.notify_q = kwargs.get("notify_q")
+        self.handler_q = kwargs.get("handler_q")
 
-    def parse_slug_from_url(self, url):
-        _parsed = urlparse(url)
+    def fetch_playlist(self):
+        s_url, s_referer, user_agent, quality = self.stream_info
+        s_origin = urlparse(s_url)._replace(path="", params="", query="", fragment="").geturl()
+        s_domain = urlparse(s_url).netloc
+        """ parse stream id "slug" """
+        _slug = None
+        _parsed = urlparse(s_url)
         if _parsed.fragment:
             for q in parse_qsl(_parsed.fragment):
                 if "slug" in q:
-                    return q[1]
+                    _slug = q[1]
         elif _parsed.query:
             for q in parse_qsl(_parsed.query):
                 if "v" in q:
-                    return q[1]
-        raise ValueError
-
-    def scrape_key_from_url(self, url):
-        headers = {
-            "Referer": self.referer,
-        }
-        r = self.s.get(url, headers=headers, timeout=15)
+                    _slug = q[1]
+        if not _slug:
+            raise ValueError
+        """ scrape key for vip streams """
+        _key = None
+        r = self.s.get(s_url, headers={"Referer": s_referer}, timeout=5, verify=False)
         r.raise_for_status()
         _key_re = re.search(r"key:\s*\W([0-9a-f]+)\W", r.text, re.I)
         if _key_re:
-            return _key_re.group(1)
-        else:
-            return None
-
-    def get_playlist_guest(self):
-        guest_url = "https://multi.idocdn.com/guest"
-        headers = {
-            "Referer": self.url,
-            "Origin": urlparse(self.url)
-            ._replace(path="", params="", query="", fragment="")
-            .geturl(),
-        }
-        data = {
-            "slug": self.slug,
-        }
-        r = self.s.post(guest_url, headers=headers, data=data, timeout=15)
+            _key = _key_re.group(1)
+        """ fetch stream infos from API """
+        _api_url = "http://multi.idocdn.com/guest"
+        _data = {"slug": _slug}
+        if _key:
+            _api_url = "http://multi.idocdn.com/vip"
+            _data = {"key": _key, "type": "slug", "value": _slug}
+        r = self.s.post(_api_url, headers={"Referer": s_url, "Origin": s_origin,}, data=_data, timeout=5, verify=False,)
         r.raise_for_status()
-        return r.json()
-
-    def get_playlist_vip(self):
-        vip_url = "https://multi.idocdn.com/vip"
-        headers = {
-            "Referer": self.url,
-            "Origin": urlparse(self.url)
-            ._replace(path="", params="", query="", fragment="")
-            .geturl(),
-        }
-        data = {
-            "key": self.key,
-            "type": "slug",
-            "value": self.slug,
-        }
-        r = self.s.post(vip_url, headers=headers, data=data, timeout=15)
-        r.raise_for_status()
-        return r.json()
-
-    def get_ping(self, stream):
-        ping_url = urljoin(self.playlist["ping"], self.playlist[stream]["id"] + "/ping")
-        headers = {
-            "Referer": self.url,
-            "Origin": urlparse(self.url)
-            ._replace(path="", params="", query="", fragment="")
-            .geturl(),
-        }
-        r = self.s.get(ping_url, headers=headers, timeout=15)
-        r.raise_for_status()
-
-    def get_key(self, key_url):
-        headers = {
-            "Referer": self.url,
-            "Origin": urlparse(self.url)
-            ._replace(path="", params="", query="", fragment="")
-            .geturl(),
-        }
-        r = self.s.get(key_url, headers=headers, timeout=15)
-        r.raise_for_status()
-        self.m3u8_key = r.content
-
-    def resolve_segment_url(self, url):
-        if url in self.segments:
-            return self.segments[url]
-        else:
-            headers = {
-                "Referer": self.url,
-                "Origin": urlparse(self.url)
-                ._replace(path="", params="", query="", fragment="")
-                .geturl(),
-            }
-            r = self.s.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            g_url = b64decode(r.json()["url"]).decode("utf-8")
-            self.segments[url] = g_url
-            return self.segments[url]
-
-    def generate_stream(self, stream):
-        if stream not in self.playlist:
-            for q in self.quality_pref:
-                if q in self.playlist:
-                    stream = q
+        s_json = r.json()
+        """ compile playlist """
+        s_stream = None
+        s_key = None
+        s_segments = []
+        s_playlist = []
+        if quality not in s_json:
+            for q in ("fullhd", "hd", "mhd", "sd", "origin"):
+                if q in s_json:
+                    quality = q
+                    s_stream = s_json[quality]
                     break
-
-        self.get_ping(stream)
-        _m3u8 = [
-            "#EXTM3U\n",
-            "#EXT-X-VERSION:4\n",
-            "#EXT-X-PLAYLIST-TYPE:VOD\n",
-            "#EXT-X-TARGETDURATION:{0}\n".format(self.playlist[stream]["duration"]),
-            "#EXT-X-MEDIA-SEQUENCE:1\n",
-        ]
-        if "hash" in self.playlist[stream]:
-            key_url = "https://{0}/hash/{1}?key={2}".format(
-                self.playlist["servers"]["stream"],
-                self.playlist[stream]["sig"],
-                self.playlist[stream]["hash"],
-            )
-            self.get_key(key_url)
-            # _m3u8.append("#EXT-X-HASH:{0}\n".format(self.playlist["hash"]))
-            _m3u8.append(
-                '#EXT-X-KEY:METHOD=AES-128,URI="http://{0}:{1}/key",IV={2}\n'.format(
-                    self.host[0], self.host[1], self.playlist[stream]["iv"],
+        else:
+            s_stream = s_json[quality]
+        if not s_stream:
+            """ stream offline/blocked """
+            print(repr(s_json))
+            self.abort.set()
+            return None, None, None
+        s_playlist.append("#EXTM3U\n")
+        s_playlist.append("#EXT-X-VERSION:4\n")
+        s_playlist.append("#EXT-X-PLAYLIST-TYPE:VOD\n")
+        s_playlist.append("#EXT-X-TARGETDURATION:{0}\n".format(s_stream["duration"]))
+        s_playlist.append("#EXT-X-MEDIA-SEQUENCE:0\n")
+        if "hash" in s_stream:
+            s_key_url = "http://{0}/hash/{1}?key={2}".format(s_json["servers"][0], s_stream["sig"], s_stream["hash"],)
+            s_playlist.append(
+                '#EXT-X-KEY:METHOD=AES-128,URI="http://{0}:{1}/{2}/key.bin",IV={3}\n'.format(
+                    self.host[0], self.host[1], self.path, s_stream["iv"]
                 )
             )
-
-        def segment_id_generator(stream):
-            next_ids = list(stream["ids"])
-            next_ids.append(next_ids.pop(0))
-            for seg_id in zip(stream["ranges"], stream["ids"], next_ids):
-                for seg_range in seg_id[0]:
-                    yield seg_range, seg_id[1], seg_id[2]
-
-        def segment_generator(stream):
-            for inf in zip(stream["extinfs"], segment_id_generator(stream)):
-                yield inf[0], inf[1][0], inf[1][1], inf[1][2]
-
-        for i, seg in enumerate(segment_generator(self.playlist[stream])):
-            _m3u8.append("#EXTINF:{0}\n".format(seg[0]))
-            _m3u8.append("#EXT-X-BYTERANGE:{0}\n".format(seg[1]))
-            _seg_url = "https://{0}/html/{1}/{2}/{3}/{4}.html?domain={5}".format(
-                self.playlist["servers"]["stream"],
-                self.playlist[stream]["sig"],
-                self.playlist[stream]["id"],
-                seg[2],
-                seg[3],
-                urlparse(self.url).netloc,
-            )
-
-            _m3u8.append(
-                "{0}\n".format(
-                    urlparse("/gslug-{:08d}.ts".format(i))
-                    ._replace(query=urlencode([("url", _seg_url)]))
-                    .geturl()
+            r = self.s.get(s_key_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
+            r.raise_for_status()
+            s_key = r.content
+        s_segment_urls = []
+        for i, _id in enumerate(s_stream["ids"]):
+            s_segment_urls.append(
+                "http://{0}/html/{1}/{2}/{3}/{4}.html?domain={5}".format(
+                    s_json["servers"][0],
+                    s_stream["sig"],
+                    s_stream["id"],
+                    s_stream["ids"][i],
+                    s_stream["ids"][(i + 1) % (len(s_stream["ids"]) - 1)],
+                    s_domain,
                 )
             )
-        _m3u8.append("#EXT-X-ENDLIST\n")
+        segment_index = 0
+        for i, rs in enumerate(s_stream["ranges"]):
+            for r in rs:
+                s_playlist.append("#EXTINF:{0},\n".format(s_stream["extinfs"][segment_index]))
+                s_playlist.append("#EXT-X-BYTERANGE:{0}\n".format(r))
+                s_playlist.append("{0}-{1}.ts\n".format(quality, segment_index))
+                s_segments.append((r, s_segment_urls[i]))
+                segment_index += 1
+        s_playlist.append("#EXT-X-ENDLIST\n")
+        return "".join(s_playlist), s_key, s_segments
 
-        self.m3u8 = b"".join([f.encode("utf-8") for f in _m3u8])
+    def run(self):
+        s_url, s_referer, user_agent, quality = self.stream_info
+        s_origin = urlparse(s_url)._replace(path="", params="", query="", fragment="").geturl()
+        while not self.abort.wait(0.1):
+            try:
+                hid = self.notify_q.get(block=True, timeout=1)
+                sid = self.handler_q[hid][0].get(block=False)
+                seg_url = self.segments[sid][1]
+                if seg_url in self.segment_urls:
+                    location = self.segment_urls[seg_url]
+                else:
+                    r = self.s.get(seg_url, headers={"Referer": s_url, "Origin": s_origin,}, timeout=5, verify=False,)
+                    r.raise_for_status()
+                    location = b64decode(r.json()["url"]).decode("utf-8")
+                    self.segment_urls[seg_url] = location
+                self.handler_q[hid][1].put(location)
+            except Empty:
+                pass
 
 
 class GslugHandler(BaseHTTPRequestHandler, object):
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, gslug, *args, **kwargs):
-        self.gslug = gslug
-        super(GslugHandler, self).__init__(*args, **kwargs)
-
     def log_message(self, format, *args):
         pass
 
     def do_HEAD(self):
-        if self.path.startswith(self.gslug.m3u8_path):
-            self.send_response(204)
-            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            self.send_header("Content-length", 0)
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
+        stream_path = posixpath.join("/", self.server.slug.path)
+        playlist_path = posixpath.join(stream_path, "chunks.m3u8")
+        if self.server.slug.playlist:
+            if self.path == playlist_path:
+                self.close_connection = 0
+                self.send_response(204)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+            else:
+                self.send_error(404)
+                self.end_headers()
         else:
-            self.send_response(404)
-            self.send_header("Content-length", 0)
-            self.send_header("Connection", "keep-alive")
+            self.send_error(500)
             self.end_headers()
 
     def do_GET(self):
-        if self.path.startswith(self.gslug.m3u8_path):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            self.send_header("Content-Length", len(self.gslug.m3u8))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(self.gslug.m3u8)
-        elif self.path.startswith("/key"):
-            self.send_response(200)
-            self.send_header("Content-Length", len(self.gslug.m3u8_key))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(self.gslug.m3u8_key)
-        elif self.path.startswith("/gslug"):
-            _gslug_url = ""
-            for q in parse_qsl(urlparse(self.path).query):
-                if "url" in q:
-                    _gslug_url = q[1]
-            if _gslug_url:
-                _location = self.gslug.resolve_segment_url(_gslug_url)
-                if _location:
-                    self.send_response(301)
-                    self.send_header("Location", _location)
-                    self.send_header("Content-length", 0)
-                    self.send_header("Connection", "keep-alive")
-                    self.end_headers()
-            else:
-                self.send_response(404)
+        handler_id = int(threading.current_thread().name)
+        stream_path = posixpath.join("/", self.server.slug.path)
+        playlist_path = posixpath.join(stream_path, "chunks.m3u8")
+        key_path = posixpath.join(stream_path, "key.bin")
+        if self.server.slug.playlist:
+            if urlparse(self.path).path == playlist_path:
+                self.close_connection = 0
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", len(self.server.slug.playlist))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(self.server.slug.playlist.encode("utf-8"))
+            elif urlparse(self.path).path == key_path:
+                self.close_connection = 0
+                self.send_response(200)
+                self.send_header("Content-Length", len(self.server.slug.key))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(self.server.slug.key)
+            elif self.path.startswith(stream_path):
+                self.close_connection = 0
+                segment_file = posixpath.split(urlparse(self.path).path)[1]
+                segment_id = int(segment_file.split(".")[0].split("-")[-1])
+                self.server.notify_q.put(handler_id)
+                self.server.handler_q[handler_id][0].put(segment_id)
+                location = self.server.handler_q[handler_id][1].get(timeout=30)
+                self.send_response(301)
+                self.send_header("Location", location)
                 self.send_header("Content-length", 0)
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+            else:
+                self.send_error(404)
+                self.end_headers()
         else:
-            self.send_response(404)
-            self.send_header("Content-length", 0)
-            self.send_header("Connection", "keep-alive")
+            self.send_error(500)
             self.end_headers()
+
+    def handle_one_request(self):
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except socket.timeout as e:
+            self.close_connection = 1
+            return
+        except socket.error as e:
+            if e[0] == errno.ECONNRESET:
+                self.close_connection = 1
+                return
+            elif e[0] == errno.EPIPE:
+                self.close_connection = 1
+                return
+            raise
+
+
+class ThreadPoolMixIn(ThreadingMixIn):
+    numThreads = 5
+    allow_reuse_address = True
+
+    def serve_forever(self, host, stream):
+        self.abort = threading.Event()
+        self.handler_q = [(Queue(), Queue()) for i in range(self.numThreads)]
+        self.notify_q = Queue()
+
+        self.slug = SlugPlaylist(
+            kwargs={"stream_info": stream, "host": host, "notify_q": self.notify_q, "handler_q": self.handler_q, "abort": self.abort}
+        )
+        self.slug.setDaemon(1)
+        self.slug.start()
+
+        # set up the threadpool
+        self.requests = Queue(self.numThreads)
+        _handlers = [threading.Thread(target=self.process_request_thread, name=str(i)) for i in range(self.numThreads)]
+        for t in _handlers:
+            t.setDaemon(1)
+            t.start()
+            
+        # server main loop
+        while not self.abort.wait(0.1):
+            self.handle_request()
+        for t in _handlers:
+            t.join(1)
+        self.slug.abort.set()
+        self.slug.join(5)
+        self.server_close()
+
+    def process_request_thread(self):
+        """
+        obtain request from queue instead of directly from server socket
+        """
+        while not self.abort.wait(0.1):
+            try:
+                request, client_address = self.requests.get(True, 1)
+                try:
+                    self.finish_request(request, client_address)
+                    self.shutdown_request(request)
+                except:
+                    self.handle_error(request, client_address)
+                    self.shutdown_request(request)
+            except Empty:
+                pass
+
+    def handle_request(self):
+        """
+        simply collect requests and put them on the queue for the workers.
+        """
+        try:
+            request, client_address = self.get_request()
+        except socket.error:
+            return
+        if self.verify_request(request, client_address):
+            self.requests.put((request, client_address))
 
 
 class GslugPlayer(Player):
@@ -303,61 +317,32 @@ class GslugMonitor(Monitor):
         self.player = GslugPlayer()
 
 
-class Server(HTTPServer):
-    """HTTPServer class with timeout."""
-
-    timeout = 5
-
-    def finish_request(self, request, client_address):
-        """Finish one request by instantiating RequestHandlerClass."""
-        try:
-            self.RequestHandlerClass(request, client_address, self)
-        except socket.error as err:
-            if err.errno not in ACCEPTABLE_ERRNO:
-                raise
-
-
-class GslugServer(ThreadingMixIn, Server, object):
-    def __init__(self, addr_port, handler_class):
-        super(GslugServer, self).__init__(addr_port, handler_class)
-        self.sessions = {}  # e.g. (addr, port) -> client socket
-
-    def get_request(self):
-        """Just call the super's method and cache the client socket"""
-        client_socket, client_addr = super(GslugServer, self).get_request()
-        self.sessions[client_addr] = client_socket
-        return (client_socket, client_addr)
-
-    def server_close(self):
-        """Close any leftover connections."""
-        super(GslugServer, self).server_close()
-        for _, sock in self.sessions.items():
-            try:
-                sock.shutdown(socket.SHUT_WR)
-            except socket.error:
-                pass
-            sock.close()
+class ThreadedServer(ThreadPoolMixIn, TCPServer):
+    pass
 
 
 if __name__ == "__main__":
-    gslug_url = sys.argv[1]
-    gslug_referer = sys.argv[2]
-    user_agent = sys.argv[3]
-    quality = sys.argv[4]
-    host = ("localhost", int(sys.argv[5]))
+    stream = (sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+    host = ("127.0.0.1", int(sys.argv[5]))
 
-    my_gslug = Gslug(gslug_url, gslug_referer, user_agent, host)
-    my_gslug.generate_stream(quality)
-
-    handler = partial(GslugHandler, my_gslug)
-    httpd = GslugServer(host, handler)
+    server = ThreadedServer(host, GslugHandler)
+    httpd = threading.Thread(target=server.serve_forever, args=(host, stream))
+    httpd.setDaemon(1)
+    httpd.start()
 
     monitor = GslugMonitor()
     while not monitor.abortRequested():
         if monitor.player.ended:
             break
-        httpd.handle_request()
-        if monitor.waitForAbort(0.1):
+        if monitor.waitForAbort(0.5):
             break
-
-    httpd.server_close()
+        if server.abort.wait(0.5):
+            break
+    server.abort.set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(host)
+        s.close()
+    except socket.error:
+        pass
+    httpd.join(5)
