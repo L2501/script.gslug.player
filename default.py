@@ -51,7 +51,7 @@ def root():
         monitor = xbmc.Monitor()
         while not monitor.abortRequested() and (timeout < 10):
             try:
-                _r = requests.get(playlist_path, stream=True, timeout=1)
+                _r = requests.head(playlist_path, timeout=1)
                 _r.raise_for_status()
                 LIVE = True
                 break

@@ -126,7 +126,7 @@ class SlugPlaylist(threading.Thread, object):
                     s_stream["sig"],
                     s_stream["id"],
                     s_stream["ids"][i],
-                    s_stream["ids"][(i + 1) % (len(s_stream["ids"]) - 1)],
+                    (s_stream["ids"][i + 1:i + 2] or s_stream["ids"][i:i + 1])[0],
                     s_domain,
                 )
             )
@@ -325,7 +325,21 @@ class GslugMonitor(Monitor):
 
 
 class ThreadedServer(ThreadPoolMixIn, TCPServer):
-    pass
+    '''HTTPServer class with timeout.'''
+    timeout = 5
+
+    def finish_request(self, request, client_address):
+        """Finish one request by instantiating RequestHandlerClass."""
+        try:
+            self.RequestHandlerClass(request, client_address, self)
+        except socket.error as e:
+            if e[0] == errno.ECONNRESET:
+                self.close_connection = 1
+                return
+            elif e[0] == errno.EPIPE:
+                self.close_connection = 1
+                return
+            raise
 
 
 if __name__ == "__main__":
